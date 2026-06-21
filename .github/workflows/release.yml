@@ -12,6 +12,7 @@ jobs:
   build:
     name: Build — ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -23,7 +24,7 @@ jobs:
             archive: tar.gz
 
           - name: macOS Apple Silicon
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             artifact: jiosaavn-macos-aarch64
             archive: tar.gz
