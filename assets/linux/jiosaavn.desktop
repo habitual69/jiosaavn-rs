@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=JioSaavn Downloader
+GenericName=Music Downloader
+Comment=High-performance JioSaavn music downloader
+Exec=jiosaavn %u
+Icon=jiosaavn
+Terminal=true
+Type=Application
+Categories=AudioVideo;Audio;Network;
+Keywords=music;jiosaavn;download;mp3;
+MimeType=x-scheme-handler/jiosaavn;
+StartupNotify=false

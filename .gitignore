@@ -1,0 +1,5 @@
+/target/
+/dist/
+/Downloads/
+jiosaavn_config.json
+*.tmp

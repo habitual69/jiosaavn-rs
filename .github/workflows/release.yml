@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build — ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: jiosaavn-linux-x86_64
+            archive: tar.gz
+
+          - name: macOS Apple Silicon
+            os: macos-14
+            target: aarch64-apple-darwin
+            artifact: jiosaavn-macos-aarch64
+            archive: tar.gz
+
+          - name: macOS Intel
+            os: macos-13
+            target: x86_64-apple-darwin
+            artifact: jiosaavn-macos-x86_64
+            archive: tar.gz
+
+          - name: Windows x86_64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            artifact: jiosaavn-windows-x86_64
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Build (release)
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Linux / macOS)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release/jiosaavn
+          staging="${{ matrix.artifact }}"
+          mkdir "$staging"
+          cp "$BIN" "$staging/"
+          cp README.md CHANGELOG.md LICENSE "$staging/"
+          tar czf "$staging.tar.gz" "$staging"
+          echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $bin = "target\${{ matrix.target }}\release\jiosaavn.exe"
+          $staging = "${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item $bin $staging\
+          Copy-Item README.md, CHANGELOG.md, LICENSE $staging\
+          Compress-Archive -Path "$staging\*" -DestinationPath "$staging.zip"
+          echo "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ env.ASSET }}
+          retention-days: 1
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Extract release notes from CHANGELOG
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Pull the block between the first ## [x.y.z] header and the next one
+          NOTES=$(awk "/^## \[$VERSION\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
+          {
+            echo "notes<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "jiosaavn-rs ${{ github.ref_name }}"
+          body: ${{ steps.changelog.outputs.notes }}
+          draft: false
+          prerelease: false
+          files: artifacts/**
