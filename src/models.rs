@@ -12,13 +12,9 @@ pub struct Track {
     pub image_url: String,
     pub has_lyrics: bool,
     pub music: String,
-    pub label: String,
     pub copyright_text: String,
     pub language: String,
     pub explicit: bool,
-    pub featured_artists: String,
-    pub singers: String,
-    pub starring: String,
     pub release_date: String,
     pub perma_url: String,
     pub media_preview_url: String,
@@ -60,7 +56,6 @@ impl Album {
 
 #[derive(Debug, Clone)]
 pub struct Playlist {
-    pub id: String,
     pub name: String,
     pub tracks: Vec<Track>,
     pub image_url: String,
@@ -76,7 +71,6 @@ impl Playlist {
 pub enum DownloadStatus {
     Completed,
     Failed(String),
-    Skipped,
 }
 
 #[derive(Debug)]
@@ -84,7 +78,6 @@ pub struct DownloadResult {
     pub track: Track,
     pub status: DownloadStatus,
     pub file_path: Option<PathBuf>,
-    pub bytes_downloaded: u64,
 }
 
 impl DownloadResult {

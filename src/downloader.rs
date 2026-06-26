@@ -24,8 +24,8 @@ pub struct DownloadManager {
 }
 
 impl DownloadManager {
-    pub fn new(client: Arc<JioSaavnClient>, config: Config) -> Result<Self> {
-        let http = Client::builder()
+    pub fn new_with_proxy(client: Arc<JioSaavnClient>, config: Config, proxy: Option<&str>) -> Result<Self> {
+        let mut builder = Client::builder()
             .use_rustls_tls()
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             .default_headers({
@@ -34,9 +34,11 @@ impl DownloadManager {
                 h.insert("Origin", "https://www.jiosaavn.com".parse().unwrap());
                 h
             })
-            .timeout(std::time::Duration::from_secs(config.timeout_secs + 90))
-            .build()?;
-
+            .timeout(std::time::Duration::from_secs(config.timeout_secs + 90));
+        if let Some(p) = proxy {
+            builder = builder.proxy(reqwest::Proxy::all(p)?);
+        }
+        let http = builder.build()?;
         let max = config.max_concurrent_downloads;
         Ok(Self {
             client,
@@ -72,17 +74,15 @@ impl DownloadManager {
         ui.display_album_info(&album);
 
         let folder = generate_album_folder(&album.artists, &album.title, &album.year);
-        let output_dir = self.config.download_path().join(folder);
+        let output_dir = self.config.download_path().join(&folder);
         let _ = tokio::fs::create_dir_all(&output_dir).await;
 
-        // Pre-fetch album art once for all tracks
         let album_art: Option<Vec<u8>> = self
             .client
             .download_bytes(&album.high_res_image_url())
             .await
             .ok();
 
-        // Save standalone cover.jpg
         if let Some(art) = &album_art {
             let _ = tokio::fs::write(output_dir.join("cover.jpg"), art).await;
         }
@@ -124,13 +124,22 @@ impl DownloadManager {
             })
             .collect();
 
-        let results: Vec<DownloadResult> = futures::future::join_all(tasks)
+        let mut results: Vec<DownloadResult> = futures::future::join_all(tasks)
             .await
             .into_iter()
             .filter_map(|r| r.ok())
             .collect();
 
         overall.finish_and_clear();
+
+        // Auto-retry failed tracks once
+        results = self.retry_failed(results, &output_dir, total, ui).await;
+
+        // Generate M3U
+        if self.config.generate_m3u {
+            let _ = write_m3u(&output_dir, &results).await;
+        }
+
         results
     }
 
@@ -138,10 +147,9 @@ impl DownloadManager {
         ui.display_playlist_info(&playlist);
 
         let folder = format!("Playlist - {}", sanitize_filename::sanitize(&playlist.name));
-        let output_dir = self.config.download_path().join(folder);
+        let output_dir = self.config.download_path().join(&folder);
         let _ = tokio::fs::create_dir_all(&output_dir).await;
 
-        // Save playlist cover (not passed to individual tracks — each fetches its own album art)
         if !playlist.image_url.is_empty() {
             let cover_url = playlist
                 .image_url
@@ -176,7 +184,6 @@ impl DownloadManager {
                         http,
                     };
                     let _permit = mgr.semaphore.acquire().await.unwrap();
-                    // album_art = None → each track fetches its own cover
                     let result = mgr
                         .download_one(track, &out, i + 1, total, None, None, &pb)
                         .await;
@@ -187,19 +194,84 @@ impl DownloadManager {
             })
             .collect();
 
-        let results: Vec<DownloadResult> = futures::future::join_all(tasks)
+        let mut results: Vec<DownloadResult> = futures::future::join_all(tasks)
             .await
             .into_iter()
             .filter_map(|r| r.ok())
             .collect();
 
         overall.finish_and_clear();
+
+        // Auto-retry failed tracks once
+        results = self.retry_failed(results, &output_dir, total, ui).await;
+
+        // Generate M3U
+        if self.config.generate_m3u {
+            let _ = write_m3u(&output_dir, &results).await;
+        }
+
         results
+    }
+
+    pub async fn download_artist(
+        &self,
+        artist_name: &str,
+        albums: Vec<Album>,
+        ui: &DownloadUI,
+    ) -> Vec<DownloadResult> {
+        let mut all_results = Vec::new();
+        let base_dir = self.config.download_path();
+
+        for album in albums {
+            let album_folder = generate_album_folder(&album.artists, &album.title, &album.year);
+            let mut album_config = self.config.clone();
+            album_config.download_dir = base_dir
+                .join(sanitize_filename::sanitize(artist_name))
+                .join(&album_folder)
+                .to_string_lossy()
+                .to_string();
+            let _ = tokio::fs::create_dir_all(&album_config.download_path()).await;
+
+            let album_mgr = DownloadManager {
+                client: Arc::clone(&self.client),
+                config: album_config,
+                semaphore: Arc::clone(&self.semaphore),
+                http: self.http.clone(),
+            };
+            let mut results = album_mgr.download_album(album, ui).await;
+            all_results.append(&mut results);
+        }
+        all_results
+    }
+
+    // ─── Retry failed tracks ──────────────────────────────────────────────────
+
+    async fn retry_failed(
+        &self,
+        results: Vec<DownloadResult>,
+        output_dir: &PathBuf,
+        total: usize,
+        ui: &DownloadUI,
+    ) -> Vec<DownloadResult> {
+        let mut final_results = Vec::with_capacity(results.len());
+        for r in results {
+            if matches!(r.status, DownloadStatus::Failed(_)) {
+                ui.info(&format!("Retrying: {}", r.track.title));
+                let pb = ui.add_track_bar(&r.track, 0);
+                let position = final_results.len() + 1;
+                let retried = self.download_one(r.track, output_dir, position, total, None, None, &pb).await;
+                pb.finish_and_clear();
+                final_results.push(retried);
+            } else {
+                final_results.push(r);
+            }
+        }
+        final_results
     }
 
     // ─── Core single-track download ───────────────────────────────────────────
 
-    async fn download_one(
+    pub async fn download_one(
         &self,
         mut track: Track,
         output_dir: &PathBuf,
@@ -213,11 +285,10 @@ impl DownloadManager {
             .try_download(&mut track, output_dir, position, total, album_artist, album_art, pb)
             .await
         {
-            Ok((file_path, bytes)) => DownloadResult {
+            Ok((file_path, _bytes)) => DownloadResult {
                 track,
                 status: DownloadStatus::Completed,
                 file_path: Some(file_path),
-                bytes_downloaded: bytes,
             },
             Err(e) => {
                 pb.set_message(format!("✗ {}", track.title));
@@ -225,7 +296,6 @@ impl DownloadManager {
                     track,
                     status: DownloadStatus::Failed(e.to_string()),
                     file_path: None,
-                    bytes_downloaded: 0,
                 }
             }
         }
@@ -249,10 +319,13 @@ impl DownloadManager {
         }
 
         let m4a_path = output_dir.join(generate_filename(track, position, ".m4a"));
-
-        // Skip if already downloaded (check both m4a and mp3)
         let mp3_path = m4a_path.with_extension("mp3");
-        if m4a_path.exists() || mp3_path.exists() {
+
+        // Handle no_skip: delete existing file to force re-download
+        if self.config.no_skip {
+            if m4a_path.exists() { let _ = tokio::fs::remove_file(&m4a_path).await; }
+            if mp3_path.exists() { let _ = tokio::fs::remove_file(&mp3_path).await; }
+        } else if m4a_path.exists() || mp3_path.exists() {
             return Ok((if mp3_path.exists() { mp3_path } else { m4a_path }, 0));
         }
 
@@ -267,14 +340,12 @@ impl DownloadManager {
 
         let bytes_downloaded = self.stream_to_file(&cdn_url, &m4a_path, pb).await?;
 
-        // Fetch per-track album art if not provided (playlist downloads)
         let owned_art: Option<Vec<u8>>;
         if album_art.is_none() {
             owned_art = self.client.download_bytes(&track.high_res_image_url()).await.ok();
             album_art = owned_art.as_deref();
         }
 
-        // Lyrics
         let lyrics_owned: Option<String>;
         if track.has_lyrics {
             lyrics_owned = self.client.get_lyrics(&track.id).await;
@@ -283,10 +354,8 @@ impl DownloadManager {
         }
         let lyrics = lyrics_owned.as_deref();
 
-        // Tag the M4A file
         tag_m4a(&m4a_path, track, album_art, lyrics, position, total, album_artist)?;
 
-        // Convert to MP3 if configured
         let final_path = if self.config.output_format.to_lowercase() == "mp3" {
             if is_ffmpeg_available() {
                 let mp3 = convert_to_mp3(&m4a_path, &self.config.mp3_quality).await?;
@@ -303,6 +372,14 @@ impl DownloadManager {
             m4a_path
         };
 
+        // Write lyrics sidecar (.lrc) if requested
+        if self.config.save_lyrics {
+            if let Some(lyr) = lyrics.filter(|s| !s.is_empty()) {
+                let lrc_path = final_path.with_extension("lrc");
+                let _ = tokio::fs::write(&lrc_path, lyr).await;
+            }
+        }
+
         Ok((final_path, bytes_downloaded))
     }
 
@@ -315,7 +392,6 @@ impl DownloadManager {
             match self.do_stream(url, path, pb).await {
                 Ok(n) => return Ok(n),
                 Err(e) if attempt < 2 => {
-                    // Remove partial file before retry
                     let _ = tokio::fs::remove_file(path).await;
                     tokio::time::sleep(delay).await;
                     delay *= 2;
@@ -345,10 +421,36 @@ impl DownloadManager {
             let chunk = chunk?;
             file.write_all(&chunk).await?;
             downloaded += chunk.len() as u64;
-            pb.set_position(downloaded);
+            pb.set_position(downloaded); // also advances the spinner tick
         }
 
         file.flush().await?;
         Ok(downloaded)
     }
+}
+
+// ─── M3U helper ──────────────────────────────────────────────────────────────
+
+async fn write_m3u(output_dir: &PathBuf, results: &[DownloadResult]) -> Result<()> {
+    let mut lines = vec!["#EXTM3U".to_string()];
+    for r in results {
+        if matches!(r.status, DownloadStatus::Completed) {
+            if let Some(fp) = &r.file_path {
+                let filename = fp.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let extinf = format!(
+                    "#EXTINF:{},{} - {}",
+                    r.track.duration,
+                    r.track.artists,
+                    r.track.title
+                );
+                lines.push(extinf);
+                lines.push(filename);
+            }
+        }
+    }
+    let content = lines.join("\n") + "\n";
+    tokio::fs::write(output_dir.join("playlist.m3u"), content).await?;
+    Ok(())
 }

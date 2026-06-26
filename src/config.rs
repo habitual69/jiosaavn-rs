@@ -12,7 +12,23 @@ pub struct Config {
     pub bitrate: String,
     pub timeout_secs: u64,
     pub chunk_size: usize,
+
+    // --- runtime-only flags (never persisted to JSON) ---
+    #[serde(skip)]
+    pub no_skip: bool,
+    #[serde(skip, default = "default_true")]
+    pub generate_m3u: bool,
+    #[serde(skip)]
+    pub save_lyrics: bool,
+    #[serde(skip)]
+    pub log_downloads: bool,
+    #[serde(skip)]
+    pub year_folders: bool,
+    #[serde(skip)]
+    pub dry_run: bool,
 }
+
+fn default_true() -> bool { true }
 
 impl Default for Config {
     fn default() -> Self {
@@ -24,6 +40,12 @@ impl Default for Config {
             bitrate: "320".to_string(),
             timeout_secs: 30,
             chunk_size: 8192,
+            no_skip: false,
+            generate_m3u: true,
+            save_lyrics: false,
+            log_downloads: false,
+            year_folders: false,
+            dry_run: false,
         }
     }
 }
@@ -33,15 +55,20 @@ impl Config {
         let path = Self::config_path();
         if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(s) => match serde_json::from_str(&s) {
-                    Ok(c) => return c,
+                Ok(s) => match serde_json::from_str::<Config>(&s) {
+                    Ok(mut c) => {
+                        // serde(skip) fields get Default::default() on deserialize,
+                        // but generate_m3u should default to true — fix it here.
+                        c.generate_m3u = true;
+                        return c;
+                    }
                     Err(e) => eprintln!("Warning: could not parse config: {e}"),
                 },
                 Err(e) => eprintln!("Warning: could not read config: {e}"),
             }
         }
         let cfg = Self::default();
-        cfg.save(); // create default config on first run
+        cfg.save();
         cfg
     }
 
@@ -64,11 +91,30 @@ impl Config {
         PathBuf::from(&self.download_dir)
     }
 
+    /// Apply a named quality/concurrency profile.
+    pub fn apply_profile(&mut self, profile: &str) {
+        match profile {
+            "hifi" => {
+                self.output_format = "m4a".to_string();
+                self.max_concurrent_downloads = 3;
+            }
+            "mobile" => {
+                self.output_format = "mp3".to_string();
+                self.mp3_quality = "128k".to_string();
+                self.max_concurrent_downloads = 10;
+            }
+            "podcast" => {
+                self.output_format = "mp3".to_string();
+                self.mp3_quality = "192k".to_string();
+                self.max_concurrent_downloads = 5;
+            }
+            _ => {}
+        }
+    }
+
     fn config_path() -> PathBuf {
-        // Sit beside the executable when frozen, otherwise in CWD
         if let Ok(exe) = std::env::current_exe() {
             let candidate = exe.parent().unwrap_or(std::path::Path::new(".")).join(CONFIG_FILE);
-            // Use CWD if exe dir looks like a temp dir (e.g. cargo run)
             if candidate.parent().map(|p| p.to_string_lossy().contains("target")).unwrap_or(false) {
                 return PathBuf::from(CONFIG_FILE);
             }

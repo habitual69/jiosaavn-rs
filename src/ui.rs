@@ -14,6 +14,7 @@ const LOGO: &str = r#"
                    High-Performance Music Downloader v1.0 (Rust)
 "#;
 
+#[derive(Clone)]
 pub struct DownloadUI {
     pub multi: Arc<MultiProgress>,
 }
@@ -30,19 +31,30 @@ impl DownloadUI {
     }
 
     pub fn info(&self, msg: &str) {
-        eprintln!("{} {}", style("ℹ").blue().bold(), msg);
+        let _ = self.multi.println(format!("{} {}", style("ℹ").blue().bold(), msg));
     }
 
     pub fn success(&self, msg: &str) {
-        eprintln!("{} {}", style("✓").green().bold(), msg);
+        let _ = self.multi.println(format!("{} {}", style("✓").green().bold(), msg));
     }
 
     pub fn error(&self, msg: &str) {
-        eprintln!("{} {}", style("✗").red().bold(), msg);
+        let _ = self.multi.println(format!("{} {}", style("✗").red().bold(), msg));
     }
 
     pub fn warn(&self, msg: &str) {
-        eprintln!("{} {}", style("⚠").yellow().bold(), msg);
+        let _ = self.multi.println(format!("{} {}", style("⚠").yellow().bold(), msg));
+    }
+
+    /// Clear the MultiProgress renderer and restore the terminal to normal mode.
+    /// Call this before any direct terminal output after downloads complete.
+    pub fn finalize(&self) {
+        let _ = self.multi.clear();
+        // indicatif hides the cursor and can leave echo disabled; restore both
+        let _ = console::Term::stderr().show_cursor();
+        let _ = console::Term::stdout().show_cursor();
+        #[cfg(unix)]
+        let _ = std::process::Command::new("stty").arg("sane").status();
     }
 
     pub fn display_album_info(&self, album: &Album) {
@@ -90,7 +102,6 @@ impl DownloadUI {
             track.title.clone()
         };
         pb.set_message(title);
-        pb.enable_steady_tick(std::time::Duration::from_millis(80));
         pb
     }
 
@@ -103,11 +114,11 @@ impl DownloadUI {
         .unwrap()
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
         pb.set_style(style);
-        pb.enable_steady_tick(std::time::Duration::from_millis(80));
         pb
     }
 
     pub fn show_summary(&self, results: &[DownloadResult]) {
+        self.finalize();
         println!();
         println!("{}", style("─── Download Summary ───────────────────").cyan());
         println!(
@@ -123,7 +134,6 @@ impl DownloadUI {
             let status = match &r.status {
                 DownloadStatus::Completed => style("✓ Complete").green().to_string(),
                 DownloadStatus::Failed(e) => style(format!("✗ {}", &e[..e.len().min(20)])).red().to_string(),
-                DownloadStatus::Skipped => style("⊘ Skipped").yellow().to_string(),
             };
             println!(
                 "  {:<4} {:<42} {:<26} {}",
@@ -136,14 +146,12 @@ impl DownloadUI {
 
         println!("{}", style("────────────────────────────────────────────────────────────────────────────").dim());
 
-        let ok = results.iter().filter(|r| r.success()).count();
+        let ok   = results.iter().filter(|r| r.success()).count();
         let fail = results.iter().filter(|r| matches!(r.status, DownloadStatus::Failed(_))).count();
-        let skip = results.iter().filter(|r| matches!(r.status, DownloadStatus::Skipped)).count();
         println!(
-            "\n  {} completed   {} failed   {} skipped\n",
+            "\n  {} completed   {} failed\n",
             style(ok).green().bold(),
             style(fail).red().bold(),
-            style(skip).yellow().bold(),
         );
     }
 }
